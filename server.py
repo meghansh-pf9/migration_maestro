@@ -349,6 +349,9 @@ def _parse_vms(vms_data: dict) -> tuple[list[dict], set, set]:
         cluster_name = spec_vms.get("clusterName", "")
         esx_name     = spec_vms.get("esxiName", "") or meta_labels.get("vjailbreak.k8s.pf9.io/esxi-name", "")
 
+        # Log cluster_name so we can verify it's populated
+        print(f"[parse_vms] {name} clusterName={cluster_name!r} esxiName={esx_name!r}", flush=True)
+
         vm_entry = {
             "name":          name,
             "vmid":          vmid,
@@ -458,9 +461,9 @@ def _parse_openstack(os_data: dict) -> dict:
         cluster_id   = h.get("id", "") or cluster_name
         if cluster_name:
             clusters.append(cluster_name)
-        if not pcd_cluster and (cluster_id or cluster_name):
-            # formValues.pcdCluster expects the cluster ID (falls back to name)
-            pcd_cluster = cluster_id or cluster_name
+        if not pcd_cluster and (cluster_name or cluster_id):
+            # formValues.pcdCluster expects the cluster name (not the UUID id)
+            pcd_cluster = cluster_name or cluster_id
 
     return {
         "cred_name":        cred_name,
@@ -722,8 +725,20 @@ def _build_bucket_cr(bucket: dict, net_maps: list, stor_maps: list,
         raw = raw_vm_store.get(key)
         if not raw:
             continue
-        if not source_cluster and raw.get("clusterName"):
-            source_cluster = raw["clusterName"]
+
+        if not source_cluster:
+            cl = raw.get("clusterName", "")
+            if cl:
+                source_cluster = cl
+            else:
+                # Fallback: build compound path from label if clusterName is empty
+                # format: {vmwarecreds-name}:{datacenter}:{cluster}
+                # label vjailbreak.k8s.pf9.io/vmware-cluster stores the cluster segment
+                cluster_seg = (raw.get("labels") or {}).get("vjailbreak.k8s.pf9.io/vmware-cluster", "")
+                if cluster_seg:
+                    source_cluster = f"{vmware_creds}::{cluster_seg}"
+                    print(f"[build_cr] clusterName empty for {key}, fell back to {source_cluster!r}", flush=True)
+
         fv_vms.append(raw)
 
     # formValues is the verbatim Migration Form FormValues object.
