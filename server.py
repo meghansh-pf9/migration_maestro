@@ -36,10 +36,16 @@ Apply the bucket creation ruleset to that data and output a complete mock bucket
 The message contains an INVENTORY JSON array. Each VM object has:
   name, migration_key, power_state (poweredOff|running), os_family (windowsGuest|linuxGuest),
   nic_count, disk_count, total_disk_gb, networks[], datastores[],
-  cpu, memory_mb, migrated (bool), flagged (bool)
+  cpu, memory_mb, migrated (bool), flagged (bool), already_bucketed (bool)
 
-Skip VMs where migrated == true.
-Flagged VMs (flagged == true) go to the special last bucket "flagged-review".
+STRICT EXCLUSION RULES — enforce before any grouping:
+1. Skip VMs where migrated == true
+2. Skip VMs where already_bucketed == true — they belong to an existing bucket, never re-assign them
+3. Flagged VMs (flagged == true, already_bucketed == false) → "flagged-review" bucket (last)
+
+The default bucket is owned by the system (HAS_DEFAULT_BUCKET in message).
+Never set isDefault: true if HAS_DEFAULT_BUCKET is true.
+Never include VMs from the default bucket in any new bucket (they are already_bucketed).
 
 ### Step 2 — Classify each VM
   large = disk_count > 1  OR  total_disk_gb >= 200
@@ -626,23 +632,52 @@ async def inventory_data():
         if not vmware_creds_name and vc_data.get("items"):
             vmware_creds_name = vc_data["items"][0].get("metadata", {}).get("name", "")
 
-        # Fetch existing MigrationBuckets (to know what's already created)
+        # Fetch existing MigrationBuckets (to know what's already created + read vmwareCluster)
         mb_raw  = execute_shell("kubectl get migrationbuckets -n migration-system -o json")
         mb_data = safe_parse(mb_raw)
         existing_buckets = []
         has_default_bucket = False
+        known_vmware_cluster = ""
+        already_bucketed_vms: set[str] = set()   # VMs in ANY existing bucket — must not be re-assigned
+
         for item in mb_data.get("items", []):
-            is_def = item.get("spec", {}).get("isDefault", False)
+            spec    = item.get("spec", {}) or {}
+            is_def  = spec.get("isDefault", False)
+            bname   = item.get("metadata", {}).get("name", "")
+            bvms    = spec.get("vms", []) or []
+            bphase  = (item.get("status", {}) or {}).get("phase", "NotMigrated")
+
             if is_def:
                 has_default_bucket = True
+
             existing_buckets.append({
-                "name":       item.get("metadata", {}).get("name", ""),
+                "name":       bname,
                 "is_default": is_def,
-                "vm_count":   len(item.get("spec", {}).get("vms", [])),
-                "phase":      item.get("status", {}).get("phase", "NotMigrated"),
+                "vm_count":   len(bvms),
+                "phase":      bphase,
+                "vms":        bvms,   # full VM list so prompt can exclude them
             })
 
+            # All VMs in existing buckets are off-limits
+            for vm_key in bvms:
+                already_bucketed_vms.add(vm_key)
+
+            # Harvest correct vmwareCluster compound path
+            if not known_vmware_cluster:
+                fv = (spec.get("config", {}) or {}).get("formValues") or {}
+                if isinstance(fv, dict):
+                    vc = fv.get("vmwareCluster", "")
+                    if vc and ":" in vc:
+                        known_vmware_cluster = vc
+                        print(f"[inventory] harvested vmwareCluster: {vc!r}", flush=True)
+
+        print(f"[inventory] already_bucketed_vms={len(already_bucketed_vms)}: {already_bucketed_vms}", flush=True)
+
         vms, src_networks, src_datastores = _parse_vms(vms_data)
+
+        # Mark VMs that are already in an existing bucket so Claude skips them
+        for v in vms:
+            v["already_bucketed"] = v["migration_key"] in already_bucketed_vms
         os_info    = _parse_openstack(os_data)
         agent_info = _fetch_agent_sizing(vjb_data)
 
@@ -672,13 +707,16 @@ async def inventory_data():
             "total_vms":           len(vms),
             "skipped_migrated":    sum(1 for v in vms if v["migrated"]),
             "flagged_count":       sum(1 for v in vms if v["flagged"]),
+            "unbucketed_count":    sum(1 for v in vms if not v["migrated"] and not v["already_bucketed"]),
             # CR creation context
-            "vmware_creds_name":   vmware_creds_name,
-            "os_creds_name":       os_info.get("cred_name", "openstack"),
-            "pcd_cluster":         os_info.get("pcd_cluster", ""),
-            "namespace":           "migration-system",
-            "existing_buckets":    existing_buckets,
-            "has_default_bucket":  has_default_bucket,
+            "vmware_creds_name":    vmware_creds_name,
+            "os_creds_name":        os_info.get("cred_name", "openstack"),
+            "pcd_cluster":          os_info.get("pcd_cluster", ""),
+            "known_vmware_cluster": known_vmware_cluster,
+            "namespace":            "migration-system",
+            "existing_buckets":     existing_buckets,
+            "has_default_bucket":   has_default_bucket,
+            "already_bucketed_vms": sorted(already_bucketed_vms),
         })
 
     except Exception as exc:
@@ -707,6 +745,7 @@ async def clear_bucket_session(session_id: str):
 
 def _build_bucket_cr(bucket: dict, net_maps: list, stor_maps: list,
                       vmware_creds: str, os_creds: str, pcd_cluster: str,
+                      known_vmware_cluster: str = "",
                       namespace: str = "migration-system") -> dict:
     """
     Build a full MigrationBucket CR dict from a bucket plan entry + raw VM data.
@@ -727,17 +766,19 @@ def _build_bucket_cr(bucket: dict, net_maps: list, stor_maps: list,
             continue
 
         if not source_cluster:
-            cl = raw.get("clusterName", "")
-            if cl:
-                source_cluster = cl
+            # Best source: compound path harvested from an existing bucket formValues
+            if known_vmware_cluster:
+                source_cluster = known_vmware_cluster
+                print(f"[build_cr] using harvested vmwareCluster: {source_cluster!r}", flush=True)
             else:
-                # Fallback: build compound path from label if clusterName is empty
-                # format: {vmwarecreds-name}:{datacenter}:{cluster}
-                # label vjailbreak.k8s.pf9.io/vmware-cluster stores the cluster segment
-                cluster_seg = (raw.get("labels") or {}).get("vjailbreak.k8s.pf9.io/vmware-cluster", "")
-                if cluster_seg:
-                    source_cluster = f"{vmware_creds}::{cluster_seg}"
-                    print(f"[build_cr] clusterName empty for {key}, fell back to {source_cluster!r}", flush=True)
+                cl = raw.get("clusterName", "")
+                if cl and ":" in cl:
+                    source_cluster = cl   # already in compound format
+                else:
+                    # Last resort: construct from label
+                    cluster_seg = (raw.get("labels") or {}).get("vjailbreak.k8s.pf9.io/vmware-cluster", "")
+                    source_cluster = f"{vmware_creds}::{cluster_seg}" if cluster_seg else ""
+                    print(f"[build_cr] vmwareCluster fallback for {key}: {source_cluster!r}", flush=True)
 
         fv_vms.append(raw)
 
@@ -826,15 +867,29 @@ async def apply_buckets(request: Request):
         return JSONResponse({"error": "no buckets in plan"}, status_code=400)
 
     # Fetch context needed for CR construction
-    vmware_creds = body.get("vmware_creds", "vmware")
-    os_creds     = body.get("os_creds",     "openstack")
-    pcd_cluster  = body.get("pcd_cluster",  "")
-    namespace    = "migration-system"
+    vmware_creds          = body.get("vmware_creds",          "vmware")
+    os_creds              = body.get("os_creds",              "openstack")
+    pcd_cluster           = body.get("pcd_cluster",           "")
+    known_vmware_cluster  = body.get("known_vmware_cluster",  "")
+    namespace             = "migration-system"
+
+    # Build set of already-bucketed VMs for server-side enforcement
+    already_bucketed = set(body.get("already_bucketed_vms", []))
 
     yaml_docs = []
     for b in buckets:
+        # Server-side safety: strip any VMs that are already in an existing bucket
+        original_vms = b.get("vms", [])
+        b["vms"] = [v for v in original_vms if v not in already_bucketed]
+        if not b["vms"]:
+            print(f"[apply-buckets] skipping {b['name']} — all VMs already bucketed", flush=True)
+            continue
+        if len(b["vms"]) < len(original_vms):
+            print(f"[apply-buckets] {b['name']}: removed {len(original_vms)-len(b['vms'])} already-bucketed VMs", flush=True)
+
         cr = _build_bucket_cr(b, net_maps, stor_maps,
-                              vmware_creds, os_creds, pcd_cluster, namespace)
+                              vmware_creds, os_creds, pcd_cluster,
+                              known_vmware_cluster, namespace)
         yaml_docs.append(_yaml.dump(cr, default_flow_style=False))
 
     combined_yaml = "---\n" + "\n---\n".join(yaml_docs)

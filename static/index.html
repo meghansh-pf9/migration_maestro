@@ -523,7 +523,22 @@ async function loadInventory() {
     if (data.error) throw new Error(data.error);
     invData = data;
     renderMappings(data);
-    document.getElementById('submit-btn').disabled = false;
+
+    const unbucketed = data.unbucketed_count ?? data.total_vms ?? 0;
+    const btn = document.getElementById('submit-btn');
+    if (unbucketed === 0) {
+      btn.disabled = true;
+      btn.textContent = 'All VMs already bucketed';
+      btn.title = `${data.total_vms} VMs total — all are already assigned to existing buckets.`;
+      // Show info in the output panel
+      document.getElementById('empty-state').innerHTML = `
+        <div class="empty-icon">✓</div>
+        <h2>All VMs are bucketed</h2>
+        <p>Every VM in the inventory is already assigned to an existing bucket. Nothing new to plan.</p>`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = `Generate Bucket Plan (${unbucketed} VM${unbucketed !== 1 ? 's' : ''})`;
+    }
   } catch (e) {
     document.getElementById('net-mappings').innerHTML =
       `<div class="error-msg">⚠ Could not reach cluster: ${e.message}</div>`;
@@ -739,11 +754,13 @@ async function applyBuckets() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         plan,
-        net_maps:     netMaps,
-        stor_maps:    storMaps,
-        vmware_creds: invData?.vmware_creds_name || 'vmware',
-        os_creds:     invData?.os_creds_name     || 'openstack',
-        pcd_cluster:  invData?.pcd_cluster       || '',
+        net_maps:              netMaps,
+        stor_maps:             storMaps,
+        vmware_creds:          invData?.vmware_creds_name    || 'vmware',
+        os_creds:              invData?.os_creds_name        || 'openstack',
+        pcd_cluster:           invData?.pcd_cluster          || '',
+        known_vmware_cluster:  invData?.known_vmware_cluster  || '',
+        already_bucketed_vms:  invData?.already_bucketed_vms || [],
       }),
     });
     const data = await res.json();
@@ -768,6 +785,8 @@ async function resetPlan() {
   document.getElementById('reset-btn').classList.remove('vis');
   document.getElementById('apply-status')?.remove();
   lastMdBuf = '';
+  // Re-check inventory so button state reflects current cluster state
+  loadInventory();
 }
 
 // ── Tool block helpers ────────────────────────────────────────────────────────
